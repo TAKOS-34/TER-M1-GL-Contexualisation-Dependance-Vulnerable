@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, APIRouter, Depends
 from sqlalchemy.future import select
 from sqlalchemy.orm import Session
-from models import FixCommit, CveItem, Reference, CvssV30, Node, CpeMatch, Description, get_db
+from models import FixCommit, CveItem, Reference, CvssMetric, Node, CpeMatch, Description, get_db
 import requests
 
 router = APIRouter()
@@ -112,7 +112,7 @@ async def process_all_cves(db: Session = Depends(get_db)):
     cves = db.query(CveItem).all()
     results = []
     for cve in cves:
-        cvss_exists = db.query(CvssV30).filter(CvssV30.cve_item_id == cve.cve_id).first()
+        cvss_exists = db.query(CvssMetric).filter(CvssMetric.cve_item_id == cve.cve_id).first()
         if not cvss_exists:
             results.append(f"CVSS missing for {cve.cve_id}")
         else:
@@ -121,7 +121,7 @@ async def process_all_cves(db: Session = Depends(get_db)):
 
 @router.get("/cve/{cve_id}/base_score/")
 async def get_cve_base_score(cve_id: str, db: Session = Depends(get_db)):
-    cvss_data = db.query(CvssV30).filter(CvssV30.cve_item_id == cve_id).first()
+    cvss_data = db.query(CvssMetric).filter(CvssMetric.cve_item_id == cve_id).first()
     if not cvss_data:
         raise HTTPException(status_code=404, detail=f"CVSS data not found for CVE: {cve_id}")
     base_score = cvss_data.cvssData.get("baseScore")

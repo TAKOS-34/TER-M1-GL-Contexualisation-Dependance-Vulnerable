@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import requests
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import text
-from models import FixCommit, CveItem, Reference, CvssV30, Node, CpeMatch, Description, get_db
+from models import FixCommit, CveItem, Reference, CvssMetric, Node, CpeMatch, Description, get_db 
 import os
 
 router = APIRouter()

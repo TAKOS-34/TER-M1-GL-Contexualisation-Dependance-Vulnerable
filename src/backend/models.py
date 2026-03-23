@@ -23,17 +23,17 @@ def get_db() -> Session: # type: ignore
 class CveItem(Base):
     __tablename__ = "cve"
     cve_id = Column(String(255), primary_key=True)
+    euvd_id = Column(String(255), nullable=True, index=True)
     sourceIdentifier = Column("source_identifier", String(255))
     vulnStatus = Column("vuln_status", String(255))
     published = Column(DateTime, nullable=False)
     lastModified = Column("last_modified", DateTime, nullable=False)
-    evaluatorComment = Column(Text)
-    evaluatorSolution = Column(Text)
-    evaluatorImpact = Column(Text)
     
+    # Relations mises à jour
     descriptions = relationship("Description", back_populates="cve_item", cascade="all, delete-orphan")
     references = relationship("Reference", back_populates="cve_item", cascade="all, delete-orphan")
-    cvss_v30 = relationship("CvssV30", back_populates="cve_item", cascade="all, delete-orphan")
+    # Changement de nom ici pour être générique
+    cvss_metrics = relationship("CvssMetric", back_populates="cve_item", cascade="all, delete-orphan")
     nodes = relationship("Node", back_populates="cve_item", cascade="all, delete-orphan")
     fix_commits = relationship("FixCommit", back_populates="cve_item", cascade="all, delete-orphan")
 
@@ -54,16 +54,17 @@ class Reference(Base):
     tags = Column(JSON)
     cve_item = relationship("CveItem", back_populates="references")
 
-class CvssV30(Base):
-    __tablename__ = "cvss_v3"
-    id = Column("cvss_id", Integer, primary_key=True, autoincrement=True)
+class CvssMetric(Base): # Ancien CvssV30 renommé et amélioré
+    __tablename__ = "cvss_metrics"
+    id = Column(Integer, primary_key=True, autoincrement=True)
     cve_id = Column(String(255), ForeignKey("cve.cve_id", ondelete="CASCADE"))
-    cvssData = Column(JSON)
+    version = Column(String(10)) # "3.0", "3.1" ou "4.0"
+    cvssData = Column(JSON) # Contient le vecteur et le score base
     exploitabilityScore = Column(DECIMAL(3, 1))
     impactScore = Column(DECIMAL(3, 1))
     source = Column(String(255))
-    type = Column(String(255))
-    cve_item = relationship("CveItem", back_populates="cvss_v30")
+    type = Column(String(255)) # Primary ou Secondary
+    cve_item = relationship("CveItem", back_populates="cvss_metrics")
 
 class Node(Base):
     __tablename__ = "node"
@@ -92,3 +93,4 @@ class FixCommit(Base):
     commit_id = Column(String(255))
     patch = Column(Text, nullable=False)
     cve_item = relationship("CveItem", back_populates="fix_commits")
+

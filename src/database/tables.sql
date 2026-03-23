@@ -3,72 +3,70 @@ DROP TABLE IF EXISTS node;
 DROP TABLE IF EXISTS reference;
 DROP TABLE IF EXISTS fix_commit;
 DROP TABLE IF EXISTS description;
-DROP TABLE IF EXISTS cvss_v3;
+DROP TABLE IF EXISTS cvss_metrics;
 DROP TABLE IF EXISTS cve;
 
 CREATE TABLE cve (
     cve_id VARCHAR(255) PRIMARY KEY,
+    euvd_id VARCHAR(255) UNIQUE,
     source_identifier VARCHAR(255),
-    vuln_status VARCHAR(100),
-    published DATETIME,
-    last_modified DATETIME
+    vuln_status VARCHAR(255),
+    published DATETIME NOT NULL,
+    last_modified DATETIME NOT NULL
 );
 
-CREATE TABLE cvss_v3 (
-    cvss_id INTEGER PRIMARY KEY AUTO_INCREMENT,
-    vector_string VARCHAR(255),
-    attack_vector VARCHAR(100),
-    attack_complexity VARCHAR(100),
-    privileges_required VARCHAR(100),
-    user_interaction VARCHAR(100),
-    scope VARCHAR(100),
-    confidentiality_impact VARCHAR(100),
-    integrity_impact VARCHAR(100),
-    availability_impact VARCHAR(100),
-    base_score DECIMAL(3,1),
-    base_severity VARCHAR(100),
+CREATE TABLE cvss_metrics (
+    id INTEGER PRIMARY KEY AUTO_INCREMENT,
+    cve_id VARCHAR(255) NOT NULL,
+    version VARCHAR(10),
+    cvssData JSON,
+    exploitabilityScore DECIMAL(3,1),
+    impactScore DECIMAL(3,1),
     source VARCHAR(255),
-    type VARCHAR(100),
-    cve_id VARCHAR(255),
-    FOREIGN KEY (cve_id) REFERENCES cve(cve_id)
+    type VARCHAR(255),
+    FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE
 );
 
 CREATE TABLE description (
     description_id INTEGER PRIMARY KEY AUTO_INCREMENT,
-    lang VARCHAR(50),
-    value TEXT,
-    cve_id VARCHAR(255),
-    FOREIGN KEY (cve_id) REFERENCES cve(cve_id)
+    cve_id VARCHAR(255) NOT NULL,
+    lang VARCHAR(50) NOT NULL,
+    value TEXT NOT NULL,
+    FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE
 );
 
 CREATE TABLE fix_commit (
     fix_commit_id INTEGER PRIMARY KEY AUTO_INCREMENT,
-    patch LONGTEXT,
-    cve_id VARCHAR(255),
-    FOREIGN KEY (cve_id) REFERENCES cve(cve_id)
+    cve_id VARCHAR(255) NOT NULL,
+    commit_id VARCHAR(255),
+    patch TEXT NOT NULL,
+    FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE
 );
 
 CREATE TABLE reference (
     reference_id INTEGER PRIMARY KEY AUTO_INCREMENT,
-    url VARCHAR(255),
+    cve_id VARCHAR(255) NOT NULL,
+    url VARCHAR(500) NOT NULL,
     source TEXT,
     tags JSON,
-    cve_id VARCHAR(255),
-    FOREIGN KEY (cve_id) REFERENCES cve(cve_id)
+    FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE
 );
 
 CREATE TABLE node (
     node_id INTEGER PRIMARY KEY AUTO_INCREMENT,
+    cve_id VARCHAR(255) NOT NULL,
     operator VARCHAR(50),
     negate BOOLEAN,
-    cve_id VARCHAR(255),
-    FOREIGN KEY (cve_id) REFERENCES cve(cve_id)
+    FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE
 );
 
 CREATE TABLE cpe (
     cpe_id INTEGER PRIMARY KEY AUTO_INCREMENT,
-    vulnerable VARCHAR(100),
-    criteria VARCHAR(255),
-    node_id INTEGER,
-    FOREIGN KEY (node_id) REFERENCES node(node_id)
+    node_id INTEGER NOT NULL,
+    vulnerable BOOLEAN NOT NULL,
+    criteria VARCHAR(255) NOT NULL,
+    matchCriteriaId VARCHAR(36),
+    versionStartIncluding VARCHAR(255),
+    versionEndIncluding VARCHAR(255),
+    FOREIGN KEY (node_id) REFERENCES node(node_id) ON DELETE CASCADE
 );
