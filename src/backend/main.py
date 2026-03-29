@@ -32,8 +32,17 @@ EUVD_EXPLOITED = f"{EUVD_BASE}/exploitedvulnerabilities"
 EUVD_CRITICAL  = f"{EUVD_BASE}/criticalvulnerabilities"
 
 
+SHARED_CLIENT = httpx.AsyncClient(
+    follow_redirects=True, 
+    timeout=45.0,
+    headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+)
+
 def make_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    return SHARED_CLIENT
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +164,19 @@ def resolve_euvd_names(cpe: str) -> list[tuple[str, str]]:
     # and cause cross-library false positives
 
     # Deduplicate
-    seen, result = set(), []
+    seen, result = set(),[]
     for c in candidates:
         if c not in seen:
             seen.add(c)
             result.append(c)
+    
+    # queries without vendor
+    for c in list(result):
+        no_vendor = (None, c[1])
+        if no_vendor not in seen:
+            seen.add(no_vendor)
+            result.append(no_vendor)
+            
     return result
 
 # ---------------------------------------------------------------------------
@@ -496,18 +513,26 @@ def _store_unknown_cpe_marker(cpe_name: str, db: Session):
 # ---------------------------------------------------------------------------
 # EUVD FETCHERS
 # ---------------------------------------------------------------------------
-async def _euvd_search_by_product(vendor: str, product: str,
-                                   size: int = 100) -> list[dict]:
-    async with make_client() as client:
-        resp = await client.get(
+async def _euvd_search_by_product(vendor: str | None, product: str, size: int = 40) -> list[dict]:
+    try:
+        params = {"product": product, "size": size}
+        if vendor:
+            params["vendor"] = vendor
+
+        resp = await SHARED_CLIENT.get(
             EUVD_SEARCH,
-            params={"vendor": vendor, "product": product, "size": size}
+            params=params
         )
         if resp.status_code == 200:
-            return resp.json().get("items", [])
-        logger.warning(f"EUVD search vendor={vendor} product={product} "
-                       f"→ HTTP {resp.status_code}")
-    return []
+            return resp.json().get("items",[])
+            
+        logger.warning(f"EUVD search vendor={vendor} product={product} "f"→ HTTP {resp.status_code}")
+    except httpx.ReadTimeout:
+        logger.warning(f"EUVD timeout searching {vendor} {product}. Backend overloaded.")
+    except Exception as e:
+        logger.error(f"EUVD request failed: {e}")
+        
+    return[]
 
 
 async def _euvd_fetch_by_id(euvd_id: str) -> dict | None:
@@ -518,6 +543,74 @@ async def _euvd_fetch_by_id(euvd_id: str) -> dict | None:
         logger.warning(f"EUVD enisaid {euvd_id} → HTTP {resp.status_code}")
     return None
 
+# ---------------------------------------------------------------------------
+# OSV FALLBACK INTEGRATION
+# ---------------------------------------------------------------------------
+OSV_QUERY_URL = "https://api.osv.dev/v1/query"
+
+async def _osv_fetch_by_package(vendor: str, product: str, version: str) -> list[dict]:
+    queries =[
+        {"ecosystem": "Maven", "name": f"{vendor}:{product}"},
+        {"ecosystem": "PyPI", "name": product},
+        {"ecosystem": "npm", "name": product},
+        {"ecosystem": "Go", "name": product},
+    ]
+    
+    for pkg in queries:
+        try:
+            payload = {"version": version, "package": pkg}
+            # Use SHARED_CLIENT directly here too
+            resp = await SHARED_CLIENT.post(OSV_QUERY_URL, json=payload)
+            if resp.status_code == 200:
+                vulns = resp.json().get("vulns",[])
+                if vulns:
+                    return vulns
+        except Exception as e:
+            logger.error(f"OSV request failed for {pkg}: {e}")
+            
+    return[]
+
+def write_osv_to_cache(osv_item: dict, db: Session, original_cpe: str):
+    osv_id = osv_item.get("id")
+    # Prefer CVE aliases if OSV provides them, otherwise fallback to the OSV/GHSA ID
+    aliases =[a for a in osv_item.get("aliases", []) if a.startswith("CVE-")]
+    vuln_ids = aliases if aliases else [osv_id]
+    
+    for v_id in vuln_ids:
+        cve = db.query(CveItem).filter(CveItem.cve_id == v_id).first()
+        if not cve:
+            db.add(CveItem(
+                cve_id=v_id, published=datetime.utcnow(),
+                lastModified=datetime.utcnow(),
+                sourceIdentifier="OSV", vulnStatus="PUBLISHED",
+            ))
+            db.flush()
+        
+        desc = osv_item.get("summary") or osv_item.get("details", "")
+        if desc and not db.query(Description).filter(
+            Description.cve_id == v_id, Description.lang == "en"
+        ).first():
+            db.add(Description(cve_id=v_id, lang="en", value=desc[:4000]))
+
+        # Cache CVSS score if OSV provides it
+        for sev in osv_item.get("severity",[]):
+            if sev.get("type") in ("CVSS_V3", "CVSS_V4") and not db.query(CvssMetric).filter(CvssMetric.cve_id == v_id).first():
+                db.add(CvssMetric(
+                    cve_id=v_id, version="3.1",
+                    cvssData={"vectorString": sev.get("score"), "version": "3.1"},
+                    source="OSV"
+                ))
+
+        node_obj = db.query(Node).filter(Node.cve_id == v_id).first()
+        if not node_obj:
+            node_obj = Node(cve_id=v_id, operator="OR", negate=False)
+            db.add(node_obj)
+            db.flush()
+
+        if original_cpe and not db.query(CpeMatch).filter(
+            CpeMatch.node_id == node_obj.id, CpeMatch.criteria == original_cpe
+        ).first():
+            db.add(CpeMatch(node_id=node_obj.id, vulnerable=True, criteria=original_cpe))
 
 # ---------------------------------------------------------------------------
 # CORE: fetch_and_sync_cpe — pure EUVD, no NVD
@@ -540,10 +633,6 @@ async def fetch_and_sync_cpe(cpe_name: str, db: Session) -> bool:
         logger.info(f"EUVD search: vendor='{vendor}' product='{product}' "
                     f"version={target_version}")
         items = await _euvd_search_by_product(vendor, product)
-
-        if not items:
-            await asyncio.sleep(0.2)
-            continue
 
         for item in items:
             # Use strict matching with product hint to avoid variant false positives
@@ -572,10 +661,27 @@ async def fetch_and_sync_cpe(cpe_name: str, db: Session) -> bool:
             logger.exception(f"DB commit failed: {e}")
             return False
 
-        if items:
-            if not confirmed:
-                logger.info(f"EUVD: known product, v{target_version} not affected → clean")
+        if confirmed:
             break
+        
+        await asyncio.sleep(6.0)
+    
+    if not confirmed:
+        logger.info(f"EUVD missed, querying OSV fallback for: {cpe_name}")
+        osv_vulns = await _osv_fetch_by_package(parsed["vendor"], parsed["product"], target_version)
+        
+        if osv_vulns:
+            for vuln in osv_vulns:
+                logger.info(f"✓ OSV VULNERABLE: {cpe_name} → {vuln.get('id')}")
+                write_osv_to_cache(vuln, db, original_cpe=cpe_name)
+                confirmed = True
+            
+            try:
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.exception(f"DB commit failed (OSV cache): {e}")
+                return False
 
     if not confirmed:
         _store_unknown_cpe_marker(cpe_name, db)
@@ -614,10 +720,14 @@ async def get_cpe_matches_bulk(cpe_list: list[str], db: Session = Depends(get_db
 
     if misses:
         logger.info(f"Bulk: {len(hits)} hits, {len(misses)} misses")
-        await asyncio.gather(
-            *[fetch_and_sync_cpe(cpe, db) for cpe in misses],
-            return_exceptions=True
-        )
+        for cpe in misses:
+            try:
+                await fetch_and_sync_cpe(cpe, db)
+            except Exception as e:
+                logger.error(f"Error fetching {cpe}: {e}")
+            
+            await asyncio.sleep(6.0) 
+            
         for cpe in misses:
             results = db.query(CpeMatch).filter(
                 CpeMatch.criteria == cpe, CpeMatch.vulnerable == True
