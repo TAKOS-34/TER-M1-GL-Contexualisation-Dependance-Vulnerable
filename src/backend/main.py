@@ -16,7 +16,7 @@ from models import (Base, engine, get_db,
                     CveItem, CvssMetric, Node, CpeMatch, Description, Reference)
 from routers import CVSS, Fix_commits
 
-Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
