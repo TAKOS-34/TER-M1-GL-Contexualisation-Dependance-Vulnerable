@@ -21,15 +21,15 @@ class JVNSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin)
         """Check JVN API health."""
         async with make_client() as client:
             try:
-                # Try direct connection to JVN database as health check
-                # Using a simple HTTP HEAD request to check connectivity
+                # MyJVN uses a single entry point: /myjvn. We pass a valid method.
                 resp = await client.head(
-                    f"{JVN_API_BASE}/api/vuln",
+                    JVN_API_BASE,
+                    params={"method": "getVulnOverviewList", "feed": "hnd"},
                     timeout=5.0,
                     follow_redirects=True
                 )
-                # Accept 200, 404, or 405 (method not allowed) - means server is responding
-                is_healthy = resp.status_code in (200, 404, 405)
+                # Accept standard status codes that prove the server is reachable and routing
+                is_healthy = resp.status_code in (200, 400, 404, 405)
                 if not is_healthy:
                     logger.warning(f"[JVN] Health check failed: status {resp.status_code}")
                 else:
@@ -38,7 +38,6 @@ class JVNSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin)
             except Exception as e:
                 logger.warning(f"[JVN] Health check failed: {e}")
                 # Mark as healthy if we can't reach it - it might work during queries
-                # This prevents false negatives during initialization
                 return True
 
     async def query(self, cpe: str) -> List[NormalizedVulnerabilityDict]:
@@ -47,9 +46,8 @@ class JVNSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin)
             parsed = parse_cpe(cpe)
             vendor = parsed["vendor"]
             product = parsed["product"]
-            version = parsed["version"]
             
-            # JVN search by product name
+            # JVN search by product name using extracted CPE components
             results = await self._search_by_product(vendor, product)
             
             if results:
@@ -62,7 +60,7 @@ class JVNSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin)
     async def _search_by_product(
         self, vendor: str, product: str
     ) -> List[NormalizedVulnerabilityDict]:
-        """Search JVN by vendor and product."""
+        """Search JVN by vendor and product using CPE filters."""
         try:
             cache_key = self._get_cache_key("search_by_product", vendor, product)
             cached = self._get_from_cache(cache_key)
@@ -72,16 +70,15 @@ class JVNSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin)
             await self._apply_rate_limit()
             
             async with make_client() as client:
-                # JVN Search API endpoint
-                # Format: /myjvn/api/vuln/search?feed=hnd&...
+                # Real MyJVN API routing and CPE filtering
                 resp = await client.get(
-                    f"{JVN_API_BASE}/api/vuln/search",
+                    JVN_API_BASE,
                     params={
-                        "feed": "hnd",  # hnd = HND (Hankoku Vulnerability Database?)
-                        "query": f"vendor:{vendor} product:{product}",
+                        "method": "getVulnOverviewList",
+                        "feed": "hnd",
+                        "cpeName": f"cpe:/:{vendor}:{product}",
                         "lang": "en",
-                        "offset": 0,
-                        "count": 100,
+                        "ft": "json"  # Forces JSON response instead of XML
                     },
                     timeout=15.0
                 )
@@ -89,41 +86,66 @@ class JVNSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin)
                 data = resp.json()
                 
                 results: List[NormalizedVulnerabilityDict] = []
-                items = data.get("result", {}).get("items", [])
+                
+                # MyJVN's ft=json translates XML directly to JSON. 
+                # Items are usually found at the root level or nested under rdf:RDF.
+                items = data.get("item", [])
+                if not items and isinstance(data.get("rdf:RDF"), dict):
+                    items = data["rdf:RDF"].get("item", [])
+                
+                # If only one result is returned, it might be a dict instead of a list.
+                if isinstance(items, dict):
+                    items = [items]
                 
                 for item in items:
-                    # Extract CVE ID from JVN record
-                    cve_id = None
-                    cve_refs = item.get("cveList", [])
-                    if cve_refs and len(cve_refs) > 0:
-                        cve_id = cve_refs[0].get("cveId")
-                    
-                    if cve_id:
-                        # Extract CVSS score
-                        cvss_score = None
-                        cvss_vector = None
-                        cvss_list = item.get("cvssScore", [])
-                        if cvss_list and len(cvss_list) > 0:
-                            cvss = cvss_list[0]
-                            cvss_score = cvss.get("score")
-                            cvss_vector = cvss.get("vector")
+                    # Extract CVE IDs. MyJVN usually places these in sec:identifier
+                    cve_ids = []
+                    identifiers = item.get("sec:identifier", [])
+                    if isinstance(identifiers, str):
+                        identifiers = [identifiers]
                         
-                        results.append({
-                            "cve_ids": [cve_id],
-                            "euvd_id": None,
-                            "source": self.name,
-                            "base_score": cvss_score,
-                            "base_vector": cvss_vector,
-                            "base_version": "3.1",
-                            "description": item.get("title", ""),
-                            "references": [
-                                ref.get("link", "") 
-                                for ref in item.get("references", [])
-                                if ref.get("link")
-                            ],
-                            "affects_version": True,  # JVN already confirms it
-                            "raw": item,
-                        })
+                    for ident in identifiers:
+                        if "CVE" in ident:
+                            cve_ids.append(ident)
+                    
+                    # Extract CVSS Data
+                    cvss_score = None
+                    cvss_vector = None
+                    cvss_data = item.get("sec:cvss", {})
+                    
+                    if isinstance(cvss_data, list) and len(cvss_data) > 0:
+                        cvss_data = cvss_data[0]
+                        
+                    if isinstance(cvss_data, dict):
+                        # Depending on the specific feed schema, keys might have '@' prefixes
+                        raw_score = cvss_data.get("@score") or cvss_data.get("score")
+                        cvss_vector = cvss_data.get("@vector") or cvss_data.get("vector")
+                        
+                        if raw_score:
+                            try:
+                                cvss_score = float(raw_score)
+                            except ValueError:
+                                pass
+                    
+                    # Construct description and reference link
+                    description = item.get("description", "")
+                    if not description:
+                        description = item.get("title", "")
+                        
+                    link = item.get("link", "")
+                    
+                    results.append({
+                        "cve_ids": cve_ids,
+                        "euvd_id": None,
+                        "source": self.name,
+                        "base_score": cvss_score,
+                        "base_vector": cvss_vector,
+                        "base_version": "3.1", # Assuming v3.1 fallback
+                        "description": description,
+                        "references": [link] if link else [],
+                        "affects_version": True, 
+                        "raw": item,
+                    })
                 
                 self._set_in_cache(cache_key, results)
                 return results

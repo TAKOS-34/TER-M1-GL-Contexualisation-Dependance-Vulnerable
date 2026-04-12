@@ -1,12 +1,13 @@
 """NVD (National Vulnerability Database) source implementation."""
 import logging
+import asyncio
 from typing import List, Dict, Tuple, Optional
 from core.config import make_client, NVD_API_BASE, NVD_API_KEY, settings
 from core.types import NormalizedVulnerabilityDict
 from core.logger import get_logger
 from matching.cpe import parse_cpe
 from matching.version import _parse_version_safe
-from sources.base import VulnerabilitySource
+from sources.base import VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin
 
 logger = get_logger(__name__)
 
@@ -40,7 +41,7 @@ NVD_CPE_MAP: dict[tuple, tuple] = {
 }
 
 
-class NVDSource(VulnerabilitySource):
+class NVDSource(VulnerabilitySource, CachingSourceMixin, RateLimitedSourceMixin):
     """
     NVD is used ONLY as a CPE→CVE ID index.
     No vulnerability data is taken from NVD — we only extract CVE IDs,
@@ -52,12 +53,24 @@ class NVDSource(VulnerabilitySource):
         return "NVD"
 
     async def healthy(self) -> bool:
+        """Check NVD API health."""
         async with make_client() as client:
             try:
-                resp = await client.get(NVD_API_BASE, params={"resultsPerPage": 1},
-                                        timeout=5.0)
-                return resp.status_code == 200
-            except Exception:
+                # Querying a specific, known CVE is much lighter on NVD's DB 
+                # than requesting a generic page of results.
+                headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
+                resp = await client.get(
+                    NVD_API_BASE, 
+                    params={"cveId": "CVE-1999-0001"},
+                    headers=headers,
+                    timeout=10.0
+                )
+                is_healthy = resp.status_code == 200
+                if not is_healthy:
+                    logger.warning(f"[NVD] Health check failed: status {resp.status_code}")
+                return is_healthy
+            except Exception as e:
+                logger.warning(f"[NVD] Health check failed: {e}")
                 return False
 
     def _normalize_cpe(self, cpe: str) -> List[str]:
@@ -88,6 +101,7 @@ class NVDSource(VulnerabilitySource):
         return result
 
     def _version_in_range(self, nvd_vuln: dict, target: str) -> bool:
+        """Check if the target version falls within the vulnerable ranges."""
         try:
             t = _parse_version_safe(target)
             for config in nvd_vuln.get("cve", {}).get("configurations", []):
@@ -122,6 +136,11 @@ class NVDSource(VulnerabilitySource):
         Returns:
             List of CVE IDs (e.g., ["CVE-2021-44228", ...])
         """
+        cache_key = self._get_cache_key("nvd_cve_ids", cpe)
+        cached = self._get_from_cache(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             parsed = parse_cpe(cpe)
             target_version = parsed["version"]
@@ -130,6 +149,8 @@ class NVDSource(VulnerabilitySource):
 
             async with make_client() as client:
                 for cpe_try in cpe_variants:
+                    await self._apply_rate_limit()
+                    
                     try:
                         resp = await client.get(
                             NVD_API_BASE,
@@ -137,22 +158,38 @@ class NVDSource(VulnerabilitySource):
                             headers=headers,
                             timeout=20.0,
                         )
+                        
+                        # Handle NVD specific 403 Rate Limit Rejection
+                        if resp.status_code == 403:
+                            logger.warning(f"[NVD] Rate limited (403) on variant {cpe_try}. Sleeping...")
+                            await asyncio.sleep(5)
+                            continue
+                            
                         resp.raise_for_status()
                         vulns = resp.json().get("vulnerabilities", [])
+                        
                         ids = [
                             v["cve"]["id"] for v in vulns
                             if v.get("cve", {}).get("id")
                             and self._version_in_range(v, target_version)
                         ]
+                        
                         if ids:
                             logger.info(f"[NVD] Found {len(ids)} CVEs for {cpe_try}")
+                            self._set_in_cache(cache_key, ids)
                             return ids
+                            
                     except Exception as e:
                         logger.warning(f"[NVD] Variant {cpe_try} failed: {e}")
                         continue
+                        
+            # If all variants fail or yield no results
+            self._set_in_cache(cache_key, [])
+            return []
+            
         except Exception as e:
             logger.error(f"[NVD] get_cve_ids({cpe}) failed: {e}", exc_info=True)
-        return []
+            return []
 
     async def query(self, cpe: str) -> List[NormalizedVulnerabilityDict]:
         """
@@ -179,7 +216,8 @@ class NVDSource(VulnerabilitySource):
                     "raw": {},
                 })
             
-            logger.info(f"[NVD] Found {len(results)} vulnerabilities for {cpe}")
+            if results:
+                logger.info(f"[NVD] Stubbed {len(results)} vulnerabilities for {cpe}")
             return results
         except Exception as e:
             logger.error(f"[NVD] query({cpe}) failed: {e}", exc_info=True)

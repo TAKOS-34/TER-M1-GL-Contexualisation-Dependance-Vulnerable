@@ -1,183 +1,218 @@
-"""GitHub Advisory source implementation."""
+"""GitHub Advisory Database source — uses REST API, not GraphQL."""
 import logging
-from typing import List, Optional, Dict, Any
-from core.config import make_client, GITHUB_ADVISORY_URL, GITHUB_TOKEN, settings
-from core.types import NormalizedVulnerabilityDict
-from core.logger import get_logger
-from matching.cpe import parse_cpe
-from sources.base import VulnerabilitySource, CachingSourceMixin
+from matching.cpe import parse_cpe, cpe_to_osv_package
+from matching.version import version_is_affected
+from config import make_client, GITHUB_TOKEN
+from sources.base import VulnerabilitySource
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+# REST endpoint 
+GITHUB_ADVISORY_REST = "https://api.github.com/advisories"
+
+# Maven groupId:artifactId -> GitHub ecosystem package name
+GITHUB_PACKAGE_MAP: dict[tuple, str] = {
+    ("apache", "log4j-core"):               "org.apache.logging.log4j:log4j-core",
+    ("apache", "log4j-api"):                "org.apache.logging.log4j:log4j-api",
+    ("apache", "struts2-core"):             "org.apache.struts:struts2-core",
+    ("org.apache.struts", "struts2-core"):  "org.apache.struts:struts2-core",
+    ("commons-collections", "commons-collections"): "commons-collections:commons-collections",
+    ("apache", "commons-collections4"):     "org.apache.commons:commons-collections4",
+    ("apache", "commons-text"):             "org.apache.commons:commons-text",
+    ("apache", "commons-lang3"):            "org.apache.commons:commons-lang3",
+    ("commons-io", "commons-io"):           "commons-io:commons-io",
+    ("snakeyaml",  "snakeyaml"):            "org.yaml:snakeyaml",
+    ("org.yaml",   "snakeyaml"):            "org.yaml:snakeyaml",
+    ("com.h2database", "h2"):               "com.h2database:h2",
+    ("hibernate-core",  "hibernate-core"):  "org.hibernate:hibernate-core",
+    ("org.hibernate",   "hibernate-core"):  "org.hibernate:hibernate-core",
+    ("com.fasterxml.jackson.core", "jackson-databind"):  "com.fasterxml.jackson.core:jackson-databind",
+    ("com.fasterxml.jackson.core", "jackson-annotations"): "com.fasterxml.jackson.core:jackson-annotations",
+    ("com.thoughtworks.xstream", "xstream"): "com.thoughtworks.xstream:xstream",
+    ("com.alibaba", "fastjson"):            "com.alibaba:fastjson",
+    ("org.springframework", "spring-webmvc"): "org.springframework:spring-webmvc",
+    ("org.springframework", "spring-core"):   "org.springframework:spring-core",
+    ("spring-cloud-function-context", "spring-cloud-function-context"): "org.springframework.cloud:spring-cloud-function-context",
+    ("spring-cloud-gateway-server",   "spring-cloud-gateway-server"):   "org.springframework.cloud:spring-cloud-gateway-server",
+    ("netty-all",    "netty-all"):          "io.netty:netty-all",
+    ("netty-buffer", "netty-buffer"):       "io.netty:netty-buffer",
+    ("io.netty",     "netty-all"):          "io.netty:netty-all",
+    ("io.netty",     "netty-buffer"):       "io.netty:netty-buffer",
+    ("org.bouncycastle", "bcprov-jdk15on"): "org.bouncycastle:bcprov-jdk15on",
+    ("org.bouncycastle", "bcprov-jdk18on"): "org.bouncycastle:bcprov-jdk18on",
+    ("com.google.guava", "guava"):          "com.google.guava:guava",
+    ("org.eclipse.jetty", "jetty-server"):  "org.eclipse.jetty:jetty-server",
+    ("apache",                  "tomcat-embed-core"): "org.apache.tomcat.embed:tomcat-embed-core",
+    ("org.apache.tomcat.embed", "tomcat-embed-core"): "org.apache.tomcat.embed:tomcat-embed-core",
+    ("apache",           "shiro-core"):     "org.apache.shiro:shiro-core",
+    ("org.apache.shiro", "shiro-core"):     "org.apache.shiro:shiro-core",
+}
 
 
-class GitHubSource(VulnerabilitySource, CachingSourceMixin):
-    """GitHub Security Advisory source for vulnerability data."""
+class GitHubSource(VulnerabilitySource):
 
     @property
     def name(self) -> str:
         return "GitHub"
 
+    def _get_headers(self) -> dict:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        return headers
+
     async def healthy(self) -> bool:
-        """Check GitHub API health."""
-        if not GITHUB_TOKEN or GITHUB_TOKEN.startswith("ghp_example"):
-            # No token or placeholder token - mark as available (optional source)
-            logger.debug("[GitHub] API token not configured (optional source, will skip queries)")
-            return True
-        
         async with make_client() as client:
             try:
-                # Simple REST API endpoint check
                 resp = await client.get(
                     "https://api.github.com/rate_limit",
-                    headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"},
+                    headers=self._get_headers(),
                     timeout=5.0
                 )
-                is_healthy = resp.status_code == 200
-                if not is_healthy:
-                    logger.warning(f"[GitHub] Health check failed: status {resp.status_code}")
-                return is_healthy
+                return resp.status_code == 200
             except Exception as e:
                 logger.warning(f"[GitHub] Health check failed: {e}")
                 return False
 
-    async def query(self, cpe: str) -> List[NormalizedVulnerabilityDict]:
-        """Query GitHub for vulnerabilities affecting a CPE."""
-        if not GITHUB_TOKEN:
-            logger.debug(f"[GitHub] No token configured, skipping query for {cpe}")
-            return []
-        
-        try:
-            parsed = parse_cpe(cpe)
-            vendor = parsed["vendor"]
-            product = parsed["product"]
-            
-            # GitHub Advisory search is limited - we'll search by ecosystem and package
-            # Map CPE to GitHub ecosystems
-            ecosystem = self._get_ecosystem(vendor, product)
-            if not ecosystem:
-                logger.debug(f"[GitHub] Unknown ecosystem for {vendor}/{product}")
-                return []
-            
-            results = await self._search_advisories(ecosystem, product)
-            logger.info(f"[GitHub] Found {len(results)} vulnerabilities for {cpe}")
-            return results
-        except Exception as e:
-            logger.error(f"[GitHub] query({cpe}) failed: {e}", exc_info=True)
-            return []
+    def _resolve_package(self, cpe: str) -> str | None:
+        """Maps CPE to GitHub Maven package name (groupId:artifactId)."""
+        parsed  = parse_cpe(cpe)
+        vendor  = parsed["vendor"]
+        product = parsed["product"]
 
-    def _get_ecosystem(self, vendor: str, product: str) -> Optional[str]:
-        """Map vendor/product to GitHub ecosystem."""
-        # GitHub ecosystems: npm, RubyGems, PyPI, Maven, Nuget, pip, Composer, etc.
-        ecosystems = {
-            ("apache", "log4j"): "Maven",
-            ("apache", "struts"): "Maven",
-            ("apache", "commons"): "Maven",
-            ("google", "guava"): "Maven",
-            ("org.springframework", "spring"): "Maven",
-            ("com.fasterxml", "jackson"): "Maven",
-            ("org.hibernate", "hibernate"): "Maven",
-            ("netty", "netty"): "Maven",
-            ("alibaba", "fastjson"): "Maven",
-            ("python", "*"): "PyPI",
-            ("nodejs", "*"): "npm",
-            ("ruby", "*"): "RubyGems",
-            ("composer", "*"): "Composer",
-            ("nuget", "*"): "Nuget",
-        }
-        
-        # Try exact match first
         key = (vendor, product)
-        if key in ecosystems:
-            return ecosystems[key]
-        
-        # Try vendor-only match
-        for (v, p), eco in ecosystems.items():
-            if p == "*" and v == vendor:
-                return eco
-        
+        if key in GITHUB_PACKAGE_MAP:
+            return GITHUB_PACKAGE_MAP[key]
+
+        short_vendor = vendor.split(".")[-1] if "." in vendor else vendor
+        short_key    = (short_vendor, product)
+        if short_key in GITHUB_PACKAGE_MAP:
+            return GITHUB_PACKAGE_MAP[short_key]
+
+        # Generic fallback for dotted groupIds
+        if "." in vendor:
+            return f"{vendor}:{product}"
+
         return None
 
-    async def _search_advisories(
-        self, ecosystem: str, package_name: str
-    ) -> List[NormalizedVulnerabilityDict]:
-        """Search GitHub advisories using GraphQL."""
-        try:
-            cache_key = self._get_cache_key("search_advisories", ecosystem, package_name)
-            cached = self._get_from_cache(cache_key)
-            if cached is not None:
-                return cached
-            
-            # GraphQL query for advisories
-            query = """
-            query($ecosystem: SecurityAdvisoryEcosystem!, $package: String!) {
-                securityAdvisories(first: 100, ecosystem: $ecosystem, package: $package) {
-                    nodes {
-                        ghsaId
-                        cveId
-                        summary
-                        description
-                        severity
-                        cvss {
-                            score
-                            vectorString
-                        }
-                        publishedAt
-                        updatedAt
-                        references {
-                            url
-                        }
-                    }
-                }
-            }
-            """
-            
-            async with make_client() as client:
-                resp = await client.post(
-                    GITHUB_ADVISORY_URL,
-                    json={
-                        "query": query,
-                        "variables": {
-                            "ecosystem": ecosystem.upper(),
-                            "package": package_name
-                        }
-                    },
-                    headers={"Authorization": f"Bearer {GITHUB_TOKEN}"},
-                    timeout=15.0
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                
-                if "errors" in data:
-                    logger.warning(f"[GitHub] Query error: {data['errors']}")
-                    return []
-                
-                results: List[NormalizedVulnerabilityDict] = []
-                advisories = data.get("data", {}).get("securityAdvisories", {}).get("nodes", [])
-                
-                for advisory in advisories:
-                    cve_id = advisory.get("cveId")
-                    ghsa_id = advisory.get("ghsaId")
-                    
-                    if not cve_id:
-                        cve_id = ghsa_id  # Use GHSA ID if CVE not available
-                    
-                    if cve_id:
-                        cvss = advisory.get("cvss", {})
-                        results.append({
-                            "cve_ids": [cve_id],
-                            "euvd_id": None,
-                            "source": self.name,
-                            "base_score": cvss.get("score"),
-                            "base_vector": cvss.get("vectorString"),
-                            "base_version": "3.1",
-                            "description": advisory.get("summary", ""),
-                            "references": [r.get("url", "") for r in advisory.get("references", []) if r.get("url")],
-                            "affects_version": True,  # GitHub already confirms it
-                            "raw": advisory,
-                        })
-                
-                self._set_in_cache(cache_key, results)
-                return results
-        except Exception as e:
-            logger.error(f"[GitHub] _search_advisories failed: {e}", exc_info=True)
+    def _check_version_affected(self, advisory: dict, target_version: str) -> bool:
+        """
+        Check if target_version falls in any vulnerable range in the advisory.
+        GitHub REST response structure:
+          vulnerabilities[].vulnerable_version_range  e.g. ">= 2.0.0, < 2.15.0"
+          vulnerabilities[].first_patched_version     e.g. "2.15.0"
+        """
+        for vuln in advisory.get("vulnerabilities", []):
+            vvr = vuln.get("vulnerable_version_range", "")
+            if not vvr:
+                return True  # no range info → assume affected
+
+            # GitHub uses comma-separated constraints like ">= 2.0.0, < 2.15.0"
+            # We need to check all constraints are satisfied
+            constraints = [c.strip() for c in vvr.split(",")]
+            all_match   = True
+
+            for constraint in constraints:
+                if not version_is_affected(constraint, target_version):
+                    all_match = False
+                    break
+
+            if all_match:
+                return True
+
+        return False
+
+    async def query(self, cpe: str) -> list[dict]:
+        parsed         = parse_cpe(cpe)
+        target_version = parsed["version"]
+        package_name   = self._resolve_package(cpe)
+
+        if not package_name:
+            logger.debug(f"[GitHub] No package mapping for {cpe}")
             return []
+
+        logger.info(f"[GitHub] Querying: ecosystem=Maven package={package_name}")
+
+        async with make_client() as client:
+            try:
+                
+                resp = await client.get(
+                    GITHUB_ADVISORY_REST,
+                    params={
+                        "ecosystem":    "Maven",
+                        "package":      package_name,
+                        "per_page":     100,
+                        "type":         "reviewed",  # only human-reviewed advisories
+                    },
+                    headers=self._get_headers(),
+                    timeout=15.0,
+                )
+
+                if resp.status_code == 401:
+                    logger.warning("[GitHub] 401 — token missing or invalid")
+                    return []
+                if resp.status_code == 403:
+                    logger.warning("[GitHub] 403 — rate limited")
+                    return []
+                if resp.status_code != 200:
+                    logger.warning(f"[GitHub] HTTP {resp.status_code} for {package_name}: {resp.text[:200]}")
+                    return []
+
+                advisories = resp.json()
+                if not isinstance(advisories, list):
+                    logger.warning(f"[GitHub] Unexpected response format: {type(advisories)}")
+                    return []
+
+                results = []
+                for advisory in advisories:
+                    affected = self._check_version_affected(advisory, target_version)
+
+                    # Extract CVE IDs from identifiers list
+                    cve_ids = [
+                        i["value"] for i in advisory.get("identifiers", [])
+                        if i.get("type") == "CVE"
+                    ]
+                    # Also check top-level cve_id field
+                    if advisory.get("cve_id") and advisory["cve_id"] not in cve_ids:
+                        cve_ids.append(advisory["cve_id"])
+
+                    if not cve_ids:
+                        # Use GHSA ID as fallback identifier
+                        ghsa = advisory.get("ghsa_id")
+                        if ghsa:
+                            cve_ids = [ghsa]
+
+                    cvss     = advisory.get("cvss", {}) or {}
+                    severity = advisory.get("severity", "")
+
+                    # Map severity to approximate score if no CVSS
+                    score_map = {"critical": 9.5, "high": 7.5, "moderate": 5.0, "low": 2.0}
+                    base_score = (cvss.get("score")
+                                  or score_map.get(severity.lower()))
+
+                    results.append({
+                        "cve_ids":         cve_ids,
+                        "euvd_id":         None,
+                        "source":          self.name,
+                        "base_score":      base_score,
+                        "base_vector":     cvss.get("vector_string"),
+                        "base_version":    "3.1",
+                        "description":     advisory.get("summary", ""),
+                        "references":      advisory.get("references", []),
+                        "affects_version": affected,
+                        "raw":             advisory,
+                    })
+
+                matched = [r for r in results if r["affects_version"]]
+                logger.info(
+                    f"[GitHub] {package_name}: {len(advisories)} advisories, "
+                    f"{len(matched)} affect v{target_version}"
+                )
+                return results
+
+            except Exception as e:
+                logger.error(f"[GitHub] query({cpe}) failed: {e}", exc_info=True)
+                return []
