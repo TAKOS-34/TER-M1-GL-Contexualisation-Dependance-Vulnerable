@@ -7,8 +7,8 @@ from .github import GitHubSource
 from .jvn import JVNSource
 
 __all__ = [
-    #"VulnerabilitySource",
-    #"EUVDSource",
+    "VulnerabilitySource",
+    "EUVDSource",
     "OSVSource",
     "NVDSource",
     "GitHubSource",
