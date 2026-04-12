@@ -1,3 +1,5 @@
+package org.example;
+
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.embed.swing.SwingNode;
@@ -19,17 +21,21 @@ import javafx.geometry.Pos;
 
 import javax.swing.*;
 
+import org.example.Services.CveService;
 import org.graphstream.graph.Graph;
 import org.graphstream.graph.Node;
 import org.graphstream.graph.implementations.SingleGraph;
 import org.graphstream.ui.view.Viewer;
 import org.graphstream.ui.swing_viewer.SwingViewer;
 import org.graphstream.ui.swing_viewer.ViewPanel;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import java.io.File;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ConcurrentModificationException;
 import java.util.List;
-import Services.CveService;
+
 
 
 public class DependencyAnalyzerApp extends Application {
@@ -128,7 +134,13 @@ public class DependencyAnalyzerApp extends Application {
             if (projectPath == null || projectPath.isEmpty()) return;
 
             new Thread(() -> {
-                Platform.runLater(() -> graph.clear()); // Clear previous results
+                // Clear graph on Swing EDT
+                SwingUtilities.invokeLater(() -> {
+                    synchronized (graph) {
+                        graph.clear();
+                    }
+                });
+                
                 SbomExtractor.ExtractSbom(projectPath, 2);
                 File sbomFile = new File("sbom.cyclonedx.json");
                 if (sbomFile.exists()) {
@@ -141,24 +153,47 @@ public class DependencyAnalyzerApp extends Application {
                             String result = CveService.fetchDataFromApi(url);
                             System.out.println("Backend result: " + result);
 
-                            // Update Graph
-                            Platform.runLater(() -> {
-                                Node n = graph.getNode(cpe);
-                                if (n == null) {
-                                    n = graph.addNode(cpe);
-                                    n.setAttribute("ui.label", cpe);
-                                }
-                                
-                                // Analyse de la réponse (JSON array)
-                                if (result != null && !result.trim().equals("[]") && !result.isEmpty()) {
-                                    // Vulnérable : Rouge
-                                    n.setAttribute("ui.style", "fill-color: red; size: 25px; text-size: 15px;");
-                                    System.out.println("VULNERABILITY DETECTED for " + cpe);
-                                } else {
-                                    // Sain : Vert
-                                    n.setAttribute("ui.style", "fill-color: green; size: 20px; text-size: 12px;");
+                            // Update Graph on Swing EDT (same thread as renderer)
+                            SwingUtilities.invokeLater(() -> {
+                                synchronized (graph) {
+                                    try {
+                                        Node n = graph.getNode(cpe);
+                                        if (n == null) {
+                                            n = graph.addNode(cpe);
+                                            n.setAttribute("ui.label", cpe);
+                                        }
+                                        
+                                        // Parse JSON response to check if vulnerabilities were found
+                                        boolean isVulnerable = false;
+                                        try {
+                                            ObjectMapper mapper = new ObjectMapper();
+                                            JsonNode jsonResponse = mapper.readTree(result);
+                                            
+                                            // Check the "found" field in the response
+                                            if (jsonResponse.has("found") && jsonResponse.get("found").asBoolean()) {
+                                                isVulnerable = true;
+                                            }
+                                        } catch (Exception e) {
+                                            // In case of parsing error, treat as safe
+                                            isVulnerable = false;
+                                        }
+                                        
+                                        if (isVulnerable) {
+                                            // Vulnérable : Rouge
+                                            n.setAttribute("ui.style", "fill-color: red; size: 25px; text-size: 15px;");
+                                            System.out.println("VULNERABILITY DETECTED for " + cpe);
+                                        } else {
+                                            // Sain : Vert
+                                            n.setAttribute("ui.style", "fill-color: green; size: 20px; text-size: 12px;");
+                                        }
+                                    } catch (ConcurrentModificationException cme) {
+                                        System.err.println("Concurrent modification detected for " + cpe + ", will retry on next event");
+                                    }
                                 }
                             });
+                            
+                            // Delay to prevent rapid Swing EDT queue overload
+                            Thread.sleep(200);
                         } catch (Exception e) {
                             e.printStackTrace();
                         }

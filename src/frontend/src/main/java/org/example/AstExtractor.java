@@ -1,3 +1,5 @@
+package org.example;
+
 import org.eclipse.jdt.core.dom.*;
 
 import java.io.File;

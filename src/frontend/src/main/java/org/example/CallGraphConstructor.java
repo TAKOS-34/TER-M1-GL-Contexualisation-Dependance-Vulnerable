@@ -1,3 +1,5 @@
+package org.example;
+
 import com.ibm.wala.classLoader.IClass;
 import com.ibm.wala.classLoader.IMethod;
 import com.ibm.wala.ipa.callgraph.*;

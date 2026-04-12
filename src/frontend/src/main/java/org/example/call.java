@@ -1,3 +1,5 @@
+package org.example;
+
 import org.eclipse.jdt.core.dom.AST;
 import org.eclipse.jdt.core.dom.ASTParser;
 import org.eclipse.jdt.core.dom.CompilationUnit;
@@ -15,7 +17,7 @@ public class call {
                 "}";
 
         // Create the AST parser
-        ASTParser parser = ASTParser.newParser(AST.JLS8); // or AST.JLS_Latest for the latest version
+        ASTParser parser = ASTParser.newParser(AST.JLS_Latest); // Using latest JLS version
         parser.setSource(source.toCharArray());
         parser.setKind(ASTParser.K_COMPILATION_UNIT);
 

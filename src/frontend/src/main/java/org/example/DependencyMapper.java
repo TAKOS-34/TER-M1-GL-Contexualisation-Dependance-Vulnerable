@@ -1,3 +1,6 @@
+package org.example;
+
+import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
@@ -52,7 +55,11 @@ public class DependencyMapper {
 
         // Configure JavaParser to use symbol solver
         JavaSymbolSolver symbolSolver = new JavaSymbolSolver(typeSolver);
-        StaticJavaParser.getConfiguration().setSymbolResolver(symbolSolver);
+        
+        // Create a configuration and set the symbol resolver
+        ParserConfiguration config = new ParserConfiguration();
+        config.setSymbolResolver(symbolSolver);
+        StaticJavaParser.setConfiguration(config);
 
         // Parse files in the project directory and compare with deleted code fragments
         processDirectory(projectDir, typeSolver, deletedCodeFragments);

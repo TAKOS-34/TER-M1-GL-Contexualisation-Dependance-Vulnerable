@@ -94,3 +94,8 @@ class FixCommit(Base):
     patch = Column(Text, nullable=False)
     cve_item = relationship("CveItem", back_populates="fix_commits")
 
+
+def init_db():
+    """Initialize the database by creating all tables."""
+    Base.metadata.create_all(bind=engine)
+    return engine

@@ -1,4 +1,6 @@
-import Services.CveService;
+package org.example;
+
+import org.example.Services.CveService;
 import javafx.application.Application;
 
 public class Main {
