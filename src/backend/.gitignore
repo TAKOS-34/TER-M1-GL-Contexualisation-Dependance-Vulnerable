@@ -5,3 +5,4 @@ venv/
 cvss_prediction/model/*.pt
 cvss_prediction/data/*.json
 cvss_prediction/data/*.csv
+logs/

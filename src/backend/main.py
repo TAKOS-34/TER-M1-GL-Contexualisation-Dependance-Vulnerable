@@ -37,7 +37,7 @@ aggregator = Aggregator()
 
 async def _startup():
     """Initialize database on startup."""
-    logger.info("🚀 Starting Pradeo Vulnerability Aggregator v%s", settings.app.version)
+    logger.info("✓ Starting Pradeo Vulnerability Aggregator v%s", settings.app.version)
     init_db()
     logger.info("✓ Database initialized")
     

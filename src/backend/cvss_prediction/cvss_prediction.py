@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from transformers import DistilBertTokenizerFast, DistilBertModel, logging
 from cvss import CVSS3
+from parse_nvd_json_to_csv import pretreat_desc
 
 logging.set_verbosity_error()
 
@@ -45,7 +46,7 @@ def predict_cvss(description: str) -> float:
     if not description:
         return "Missing description"
 
-    enc = tokenizer(description, max_length=256, padding="max_length", truncation=True, return_tensors="pt").to(DEVICE)
+    enc = tokenizer(pretreat_desc(description), max_length=256, padding="max_length", truncation=True, return_tensors="pt").to(DEVICE)
 
     with torch.no_grad():
         logits = model(enc["input_ids"], enc["attention_mask"])
@@ -57,4 +58,12 @@ def predict_cvss(description: str) -> float:
 
     vec = "CVSS:3.1/" + "/".join(f"{name}:{m[name]}" for name in METRICS)
     score = CVSS3(vec).base_score
+
+    # print(f"Model vector : {vec}")
+    # print(f"Model score : {score}")
+
     return score
+
+# Test
+# while True:
+#     predict_cvss(pretreat_desc(input("Description : ")))

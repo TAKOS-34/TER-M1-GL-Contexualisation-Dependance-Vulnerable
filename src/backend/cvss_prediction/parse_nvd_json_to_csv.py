@@ -2,6 +2,8 @@ import json
 import csv
 from pathlib import Path
 import pandas as pd
+import html
+import re
 
 LABEL_MAPS = {
     "attackVector":          {"N": 0, "A": 1, "L": 2, "P": 3},
@@ -19,7 +21,6 @@ def get_english_description(descriptions):
         if entry.get("lang") == "en":
             value = entry.get("value", "")
             value = value.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-            value = " ".join(value.split())
 
             return value.strip()
 
@@ -54,6 +55,30 @@ def extract_cvss_rows(metrics):
 
     return rows
 
+def pretreat_desc(text: str) -> str:
+    if not isinstance(text, str): return ""
+
+    text = text.lower()
+    text = html.unescape(text)
+
+    months = r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+    text = re.sub(rf'\b{months}\s?(\d{{1,2}},)?\s?\d{{4}}\b', ' date_token ', text)
+    text = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', ' date_token ', text)
+
+    text = re.sub(r'cve-\d{4}-\d+', ' cve_id_token ', text)
+    text = re.sub(r'\bv?\d+(\.\d+|\.x|-[a-z0-9\.]+)+\b', ' version_token ', text)
+    text = re.sub(r'(/[a-z0-9._-]+)+|([a-z]:\\[\w._-]+)+', ' file_path_token ', text)
+    text = re.sub(r'0x[0-9a-fA-F]+', ' mem_addr_token ', text)
+    text = re.sub(r'http[s]?://\S+', ' url_token ', text)
+    text = re.sub(r'\S+@\S+', ' email_token ', text)
+
+    text = re.sub(r'[^a-z0-9\s.,;_]', ' ', text)
+    text = re.sub(r',+', ',', text)
+    text = re.sub(r';+', ';', text)
+    text = " ".join(text.split())
+
+    return text
+
 def process_and_append(file_path, output_csv):
     data_to_write = []
 
@@ -66,10 +91,12 @@ def process_and_append(file_path, output_csv):
 
             if not desc: continue
 
+            pre_treated_desc = pretreat_desc(desc)
+
             metrics = extract_cvss_rows(cve.get("metrics", {}))
 
             if metrics:
-                data_to_write.append({"description": desc, **metrics[0]})
+                data_to_write.append({ "description": pre_treated_desc, **metrics[0] })
 
     if data_to_write:
         df = pd.DataFrame(data_to_write)
